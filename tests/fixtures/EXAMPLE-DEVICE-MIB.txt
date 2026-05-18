@@ -1,0 +1,23 @@
+EXAMPLE-DEVICE-MIB DEFINITIONS ::= BEGIN
+
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, NOTIFICATION-TYPE
+        FROM SNMPv2-SMI
+    exampleRoot, exampleObjects, exampleNotifications
+        FROM EXAMPLE-ROOT-MIB;
+
+exampleDevice MODULE-IDENTITY
+    DESCRIPTION "Device module identity for tests."
+    ::= { exampleRoot 10 }
+
+exampleScalar OBJECT-TYPE
+    DESCRIPTION
+        "Example scalar object
+         used in tests."
+    ::= { exampleObjects 1 }
+
+exampleTrap NOTIFICATION-TYPE
+    DESCRIPTION "Example notification."
+    ::= { exampleNotifications 1 }
+
+END

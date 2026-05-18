@@ -1,0 +1,10 @@
+EXAMPLE-ROOT-MIB DEFINITIONS ::= BEGIN
+
+exampleRoot MODULE-IDENTITY
+    DESCRIPTION "Root module identity for tests."
+    ::= { enterprises 99999 }
+
+exampleObjects OBJECT IDENTIFIER ::= { exampleRoot 1 }
+exampleNotifications OBJECT IDENTIFIER ::= { exampleRoot 2 }
+
+END
