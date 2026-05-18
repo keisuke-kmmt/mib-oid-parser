@@ -2,22 +2,17 @@
 """
 Extract and resolve OIDs from SNMP MIB files without external dependencies.
 
-Design goals:
+Features:
 - Standard-library only
-- More robust than simple regex scraping
-- Handles common ASN.1 MIB declaration forms and multi-part OID expressions
+- Tokenizer + parser based implementation
 - Resolves symbols across multiple input MIB files
+- Can search dependent MIB modules from directories via IMPORTS
 
 Supported declarations:
 - <name> OBJECT IDENTIFIER ::= { ... }
 - <name> OBJECT-TYPE ::= { ... }
 - <name> MODULE-IDENTITY ::= { ... }
 - <name> NOTIFICATION-TYPE ::= { ... }
-
-Examples:
-    python mib_oid_extractor.py EXAMPLE-MIB.txt
-    python mib_oid_extractor.py mib/*.mib --format json
-    python mib_oid_extractor.py A.mib B.mib --only-kind OBJECT-TYPE
 """
 
 from __future__ import annotations
@@ -28,7 +23,7 @@ import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 
 ROOT_OIDS: Dict[str, List[int]] = {
@@ -70,6 +65,8 @@ KEYWORDS = {
     "END",
 }
 
+DEFAULT_MIB_SUFFIXES = {"", ".mib", ".txt", ".my", ".asn1"}
+
 
 @dataclass(frozen=True)
 class Token:
@@ -90,6 +87,7 @@ class Declaration:
     kind: str
     oid_components: List[OidComponent]
     source: str
+    module_name: Optional[str]
 
 
 @dataclass
@@ -98,10 +96,19 @@ class OidEntry:
     kind: str
     oid: List[int]
     source: str
+    module_name: Optional[str]
 
     @property
     def oid_str(self) -> str:
         return ".".join(str(x) for x in self.oid)
+
+
+@dataclass
+class ParsedMib:
+    source: str
+    module_name: Optional[str]
+    imports: List[str]
+    declarations: List[Declaration]
 
 
 class Tokenizer:
@@ -163,7 +170,7 @@ class Tokenizer:
             if ch.isalpha():
                 start = self.pos
                 self.pos += 1
-                while self.pos < self.length and (self.text[self.pos].isalnum() or self.text[self.pos] in "-"):
+                while self.pos < self.length and (self.text[self.pos].isalnum() or self.text[self.pos] == "-"):
                     self.pos += 1
                 value = self.text[start:self.pos]
                 kind = "KEYWORD" if value in KEYWORDS else "IDENT"
@@ -191,9 +198,21 @@ class Parser:
         self.tokens = tokens
         self.source = source
         self.pos = 0
+        self.module_name = self._detect_module_name()
+
+    def parse(self) -> ParsedMib:
+        imports = self._parse_imports()
+        declarations = self.parse_declarations()
+        return ParsedMib(
+            source=self.source,
+            module_name=self.module_name,
+            imports=imports,
+            declarations=declarations,
+        )
 
     def parse_declarations(self) -> List[Declaration]:
         declarations: List[Declaration] = []
+        self.pos = 0
         while not self._at_end():
             declaration = self._parse_one_declaration()
             if declaration is not None:
@@ -201,6 +220,38 @@ class Parser:
             else:
                 self.pos += 1
         return declarations
+
+    def _detect_module_name(self) -> Optional[str]:
+        for idx in range(len(self.tokens) - 2):
+            a = self.tokens[idx]
+            b = self.tokens[idx + 1]
+            c = self.tokens[idx + 2]
+            if a.kind == "IDENT" and b.value == "DEFINITIONS" and c.kind == "ASSIGN":
+                return a.value
+        return None
+
+    def _parse_imports(self) -> List[str]:
+        imports: List[str] = []
+        idx = 0
+        while idx < len(self.tokens):
+            tok = self.tokens[idx]
+            if tok.value != "IMPORTS":
+                idx += 1
+                continue
+
+            idx += 1
+            while idx < len(self.tokens):
+                current = self.tokens[idx]
+                if current.kind == "SEMI":
+                    return imports
+                if current.value == "FROM":
+                    next_tok = self._peek_index(idx + 1)
+                    if next_tok is not None and next_tok.kind == "IDENT":
+                        imports.append(next_tok.value)
+                        idx += 2
+                        continue
+                idx += 1
+        return imports
 
     def _parse_one_declaration(self) -> Optional[Declaration]:
         start = self.pos
@@ -234,6 +285,7 @@ class Parser:
             kind=kind,
             oid_components=oid_components,
             source=self.source,
+            module_name=self.module_name,
         )
 
     def _parse_oid_expression(self) -> List[OidComponent]:
@@ -287,7 +339,7 @@ class Parser:
         for expected, kind in patterns:
             ok = True
             for idx, expected_value in enumerate(expected):
-                token = self._peek(start + idx)
+                token = self._peek_index(start + idx)
                 if token is None or token.value != expected_value:
                     ok = False
                     break
@@ -303,9 +355,9 @@ class Parser:
         return True
 
     def _current(self) -> Optional[Token]:
-        return self._peek(self.pos)
+        return self._peek_index(self.pos)
 
-    def _peek(self, index: int) -> Optional[Token]:
+    def _peek_index(self, index: int) -> Optional[Token]:
         if index >= len(self.tokens):
             return None
         return self.tokens[index]
@@ -338,6 +390,7 @@ class Resolver:
                     kind=decl.kind,
                     oid=oid,
                     source=decl.source,
+                    module_name=decl.module_name,
                 )
                 resolved_entries[decl.name] = entry
                 self.symbols[decl.name] = oid
@@ -349,38 +402,123 @@ class Resolver:
 
     def _resolve_oid_components(self, components: Sequence[OidComponent]) -> Optional[List[int]]:
         result: List[int] = []
-
         for component in components:
             if component.symbol is not None:
                 if component.number is not None:
-                    # symbol(number) is authoritative for this arc.
                     result.append(component.number)
                     continue
-
                 symbol_oid = self.symbols.get(component.symbol)
                 if symbol_oid is None:
                     return None
                 result.extend(symbol_oid)
                 continue
-
             if component.number is not None:
                 result.append(component.number)
                 continue
-
             return None
-
         return result if result else None
 
 
-def extract_from_files(paths: Sequence[Path]) -> Tuple[List[OidEntry], List[Declaration]]:
-    declarations: List[Declaration] = []
-    for path in paths:
-        text = path.read_text(encoding="utf-8", errors="ignore")
+class MibRepository:
+    def __init__(self, mib_dirs: Sequence[Path], recursive: bool = True) -> None:
+        self.mib_dirs = [path for path in mib_dirs if path.exists() and path.is_dir()]
+        self.recursive = recursive
+        self.module_to_path: Dict[str, Path] = {}
+        self._indexed_paths: Set[Path] = set()
+
+    def build_index(self) -> None:
+        for mib_dir in self.mib_dirs:
+            for path in self._iter_candidate_files(mib_dir):
+                if path in self._indexed_paths:
+                    continue
+                self._indexed_paths.add(path)
+                module_name = self._probe_module_name(path)
+                if module_name and module_name not in self.module_to_path:
+                    self.module_to_path[module_name] = path
+
+    def find_module(self, module_name: str) -> Optional[Path]:
+        return self.module_to_path.get(module_name)
+
+    def _iter_candidate_files(self, root: Path) -> Iterator[Path]:
+        iterator = root.rglob("*") if self.recursive else root.glob("*")
+        for path in iterator:
+            if not path.is_file():
+                continue
+            suffix = path.suffix.lower()
+            if suffix in DEFAULT_MIB_SUFFIXES:
+                yield path
+
+    def _probe_module_name(self, path: Path) -> Optional[str]:
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return None
         tokens = Tokenizer(text).tokenize()
-        declarations.extend(Parser(tokens, str(path)).parse_declarations())
+        parser = Parser(tokens, str(path))
+        return parser.module_name
+
+
+class MibLoader:
+    def __init__(self, mib_dirs: Sequence[Path], recursive: bool = True) -> None:
+        self.repo = MibRepository(mib_dirs, recursive=recursive)
+        self.repo.build_index()
+        self.loaded_paths: Set[Path] = set()
+        self.loaded_modules: Set[str] = set()
+        self.unresolved_modules: Set[str] = set()
+
+    def load(self, entry_paths: Sequence[Path]) -> List[ParsedMib]:
+        parsed: List[ParsedMib] = []
+        queue: List[Path] = list(entry_paths)
+
+        while queue:
+            path = queue.pop(0)
+            path = path.resolve()
+            if path in self.loaded_paths:
+                continue
+            self.loaded_paths.add(path)
+
+            mib = self._parse_path(path)
+            if mib is None:
+                continue
+            parsed.append(mib)
+            if mib.module_name:
+                self.loaded_modules.add(mib.module_name)
+
+            for module_name in mib.imports:
+                if module_name in self.loaded_modules:
+                    continue
+                dep_path = self.repo.find_module(module_name)
+                if dep_path is None:
+                    self.unresolved_modules.add(module_name)
+                    continue
+                queue.append(dep_path)
+
+        return parsed
+
+    def _parse_path(self, path: Path) -> Optional[ParsedMib]:
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return None
+        tokens = Tokenizer(text).tokenize()
+        return Parser(tokens, str(path)).parse()
+
+
+def extract_from_files(
+    paths: Sequence[Path],
+    mib_dirs: Sequence[Path],
+    recursive: bool = True,
+) -> Tuple[List[OidEntry], List[Declaration], Set[str]]:
+    loader = MibLoader(mib_dirs, recursive=recursive)
+    parsed_mibs = loader.load(paths)
+
+    declarations: List[Declaration] = []
+    for mib in parsed_mibs:
+        declarations.extend(mib.declarations)
 
     resolver = Resolver()
-    return resolver.resolve(declarations)
+    entries, unresolved_declarations = resolver.resolve(declarations)
+    return entries, unresolved_declarations, loader.unresolved_modules
 
 
 def filter_entries(entries: Iterable[OidEntry], only_kind: Optional[str]) -> List[OidEntry]:
@@ -424,6 +562,7 @@ def print_json(entries: List[OidEntry]) -> None:
             "oid": e.oid,
             "oid_str": e.oid_str,
             "source": e.source,
+            "module_name": e.module_name,
         }
         for e in entries
     ]
@@ -432,16 +571,16 @@ def print_json(entries: List[OidEntry]) -> None:
 
 def print_csv(entries: List[OidEntry]) -> None:
     writer = csv.writer(sys.stdout)
-    writer.writerow(["name", "kind", "oid_str", "source"])
+    writer.writerow(["name", "kind", "oid_str", "module_name", "source"])
     for e in entries:
-        writer.writerow([e.name, e.kind, e.oid_str, e.source])
+        writer.writerow([e.name, e.kind, e.oid_str, e.module_name or "", e.source])
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Extract and resolve OIDs from SNMP MIB files without external dependencies."
     )
-    parser.add_argument("files", nargs="+", help="Path(s) to MIB files")
+    parser.add_argument("files", nargs="+", help="Path(s) to entry MIB files")
     parser.add_argument(
         "--format",
         choices=["table", "json", "csv"],
@@ -454,9 +593,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Filter output by declaration kind",
     )
     parser.add_argument(
+        "--mib-dir",
+        action="append",
+        default=[],
+        help="Directory to search for imported dependent MIB files (can be specified multiple times)",
+    )
+    parser.add_argument(
+        "--no-recursive",
+        action="store_true",
+        help="Do not recursively search --mib-dir directories",
+    )
+    parser.add_argument(
         "--show-unresolved",
         action="store_true",
-        help="Print unresolved declarations to stderr",
+        help="Print unresolved declarations and missing imported modules to stderr",
     )
     return parser
 
@@ -472,7 +622,12 @@ def main() -> int:
             print(f"File not found: {path}", file=sys.stderr)
         return 1
 
-    entries, unresolved = extract_from_files(paths)
+    mib_dirs = [Path(name) for name in args.mib_dir]
+    entries, unresolved_declarations, unresolved_modules = extract_from_files(
+        paths=paths,
+        mib_dirs=mib_dirs,
+        recursive=not args.no_recursive,
+    )
     entries = filter_entries(entries, args.only_kind)
 
     if args.format == "json":
@@ -482,12 +637,18 @@ def main() -> int:
     else:
         print_table(entries)
 
-    if args.show_unresolved and unresolved:
-        print("\nUnresolved declarations:", file=sys.stderr)
-        for decl in unresolved:
-            print(f"- {decl.name} ({decl.kind}) in {decl.source}", file=sys.stderr)
+    if args.show_unresolved:
+        if unresolved_modules:
+            print("\nMissing imported modules:", file=sys.stderr)
+            for module_name in sorted(unresolved_modules):
+                print(f"- {module_name}", file=sys.stderr)
+        if unresolved_declarations:
+            print("\nUnresolved declarations:", file=sys.stderr)
+            for decl in unresolved_declarations:
+                module_hint = f" [{decl.module_name}]" if decl.module_name else ""
+                print(f"- {decl.name} ({decl.kind}) in {decl.source}{module_hint}", file=sys.stderr)
 
-    return 0 if entries or not unresolved else 2
+    return 0 if entries or not unresolved_declarations else 2
 
 
 if __name__ == "__main__":
