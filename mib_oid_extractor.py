@@ -7,6 +7,7 @@ Features:
 - Tokenizer + parser based implementation
 - Resolves symbols across multiple input MIB files
 - Can search dependent MIB modules from directories via IMPORTS
+- Includes DESCRIPTION text in output when present
 
 Supported declarations:
 - <name> OBJECT IDENTIFIER ::= { ... }
@@ -63,6 +64,7 @@ KEYWORDS = {
     "DEFINITIONS",
     "BEGIN",
     "END",
+    "DESCRIPTION",
 }
 
 DEFAULT_MIB_SUFFIXES = {"", ".mib", ".txt", ".my", ".asn1"}
@@ -88,6 +90,7 @@ class Declaration:
     oid_components: List[OidComponent]
     source: str
     module_name: Optional[str]
+    description: str
 
 
 @dataclass
@@ -97,6 +100,7 @@ class OidEntry:
     oid: List[int]
     source: str
     module_name: Optional[str]
+    description: str
 
     @property
     def oid_str(self) -> str:
@@ -159,6 +163,9 @@ class Tokenizer:
                 tokens.append(Token("SEMI", ch, self.pos))
                 self.pos += 1
                 continue
+            if ch == '"':
+                tokens.append(self._read_string())
+                continue
 
             if ch.isdigit():
                 start = self.pos
@@ -180,6 +187,23 @@ class Tokenizer:
             self.pos += 1
 
         return tokens
+
+    def _read_string(self) -> Token:
+        start = self.pos
+        self.pos += 1
+        chars: List[str] = []
+        while self.pos < self.length:
+            ch = self.text[self.pos]
+            if ch == '"':
+                if self._peek(1) == '"':
+                    chars.append('"')
+                    self.pos += 2
+                    continue
+                self.pos += 1
+                break
+            chars.append(ch)
+            self.pos += 1
+        return Token("STRING", "".join(chars), start)
 
     def _peek(self, offset: int) -> str:
         idx = self.pos + offset
@@ -263,7 +287,13 @@ class Parser:
         if kind is None:
             return None
 
-        self.pos = self.pos + 1 + consumed
+        body_start = self.pos + 1 + consumed
+        assign_index = self._find_assignment_index(body_start)
+        if assign_index is None:
+            return None
+
+        description = self._extract_description(body_start, assign_index)
+        self.pos = assign_index
         if not self._match("ASSIGN"):
             self.pos = start
             return None
@@ -286,7 +316,34 @@ class Parser:
             oid_components=oid_components,
             source=self.source,
             module_name=self.module_name,
+            description=description,
         )
+
+    def _find_assignment_index(self, start: int) -> Optional[int]:
+        idx = start
+        while idx < len(self.tokens):
+            token = self.tokens[idx]
+            if token.kind == "ASSIGN":
+                next_tok = self._peek_index(idx + 1)
+                if next_tok is not None and next_tok.kind == "LBRACE":
+                    return idx
+            if token.kind == "IDENT":
+                next_kind, _ = self._match_kind(idx + 1)
+                if next_kind is not None:
+                    return None
+            idx += 1
+        return None
+
+    def _extract_description(self, start: int, end: int) -> str:
+        idx = start
+        while idx < end:
+            token = self.tokens[idx]
+            if token.value == "DESCRIPTION":
+                next_tok = self._peek_index(idx + 1)
+                if next_tok is not None and next_tok.kind == "STRING":
+                    return next_tok.value.strip()
+            idx += 1
+        return ""
 
     def _parse_oid_expression(self) -> List[OidComponent]:
         components: List[OidComponent] = []
@@ -391,6 +448,7 @@ class Resolver:
                     oid=oid,
                     source=decl.source,
                     module_name=decl.module_name,
+                    description=decl.description,
                 )
                 resolved_entries[decl.name] = entry
                 self.symbols[decl.name] = oid
@@ -527,30 +585,38 @@ def filter_entries(entries: Iterable[OidEntry], only_kind: Optional[str]) -> Lis
     return [entry for entry in entries if entry.kind == only_kind]
 
 
+def _single_line(text: str) -> str:
+    return " ".join(text.split())
+
+
 def print_table(entries: List[OidEntry]) -> None:
     if not entries:
         print("No resolvable OIDs found.")
         return
 
+    normalized_descriptions = [_single_line(e.description) for e in entries]
     name_width = max(len(e.name) for e in entries)
     kind_width = max(len(e.kind) for e in entries)
     oid_width = max(len(e.oid_str) for e in entries)
     source_width = max(len(e.source) for e in entries)
+    desc_width = max(max((len(d) for d in normalized_descriptions), default=11), len("DESCRIPTION"))
 
     header = (
         f"{'NAME':<{name_width}}  "
         f"{'KIND':<{kind_width}}  "
         f"{'OID':<{oid_width}}  "
-        f"{'SOURCE':<{source_width}}"
+        f"{'SOURCE':<{source_width}}  "
+        f"{'DESCRIPTION':<{desc_width}}"
     )
     print(header)
     print("-" * len(header))
-    for entry in entries:
+    for entry, description in zip(entries, normalized_descriptions):
         print(
             f"{entry.name:<{name_width}}  "
             f"{entry.kind:<{kind_width}}  "
             f"{entry.oid_str:<{oid_width}}  "
-            f"{entry.source:<{source_width}}"
+            f"{entry.source:<{source_width}}  "
+            f"{description:<{desc_width}}"
         )
 
 
@@ -563,6 +629,7 @@ def print_json(entries: List[OidEntry]) -> None:
             "oid_str": e.oid_str,
             "source": e.source,
             "module_name": e.module_name,
+            "description": e.description,
         }
         for e in entries
     ]
@@ -571,9 +638,9 @@ def print_json(entries: List[OidEntry]) -> None:
 
 def print_csv(entries: List[OidEntry]) -> None:
     writer = csv.writer(sys.stdout)
-    writer.writerow(["name", "kind", "oid_str", "module_name", "source"])
+    writer.writerow(["name", "kind", "oid_str", "module_name", "source", "description"])
     for e in entries:
-        writer.writerow([e.name, e.kind, e.oid_str, e.module_name or "", e.source])
+        writer.writerow([e.name, e.kind, e.oid_str, e.module_name or "", e.source, e.description])
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
