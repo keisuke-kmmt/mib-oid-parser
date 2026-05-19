@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 
-from mib_oid_extractor import Parser, Tokenizer, extract_from_files
+from mib_oid_extractor import Parser, Tokenizer, extract_from_files, generate_trap_command, OidEntry
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -56,6 +56,64 @@ END
         self.assertEqual(by_name["exampleDevice"].description, "Device module identity for tests.")
         self.assertIn("Example scalar object", by_name["exampleScalar"].description)
         self.assertEqual(by_name["exampleTrap"].description, "Example notification.")
+
+
+class TestGenerateTrapCommand(unittest.TestCase):
+    def _make_entry(self, oid: list) -> OidEntry:
+        return OidEntry(
+            name="exampleTrap",
+            kind="NOTIFICATION-TYPE",
+            oid=oid,
+            source="<memory>",
+            module_name="EXAMPLE-MIB",
+            description="Example notification.",
+        )
+
+    def test_v2c_default(self):
+        entry = self._make_entry([1, 3, 6, 1, 4, 1, 99999, 2, 1])
+        cmd = generate_trap_command(entry)
+        self.assertEqual(cmd, "snmptrap -v 2c -c public localhost '' 1.3.6.1.4.1.99999.2.1")
+
+    def test_v2c_custom_host_and_community(self):
+        entry = self._make_entry([1, 3, 6, 1, 4, 1, 99999, 2, 1])
+        cmd = generate_trap_command(entry, host="192.168.1.1", community="private", version="2c")
+        self.assertEqual(cmd, "snmptrap -v 2c -c private 192.168.1.1 '' 1.3.6.1.4.1.99999.2.1")
+
+    def test_v1(self):
+        entry = self._make_entry([1, 3, 6, 1, 4, 1, 99999, 2, 1])
+        cmd = generate_trap_command(entry, version="1")
+        self.assertEqual(
+            cmd,
+            'snmptrap -v 1 -c public localhost 1.3.6.1.4.1.99999.2 "" 6 1 0',
+        )
+
+    def test_v1_single_component_oid(self):
+        entry = self._make_entry([1])
+        cmd = generate_trap_command(entry, version="1")
+        self.assertEqual(cmd, 'snmptrap -v 1 -c public localhost 1 "" 6 0 0')
+
+    def test_v3(self):
+        entry = self._make_entry([1, 3, 6, 1, 4, 1, 99999, 2, 1])
+        cmd = generate_trap_command(entry, community="trapuser", version="3")
+        self.assertEqual(
+            cmd,
+            "snmptrap -v 3 -u trapuser -l noAuthNoPriv localhost '' 1.3.6.1.4.1.99999.2.1",
+        )
+
+    def test_unsupported_version_raises(self):
+        entry = self._make_entry([1, 3, 6, 1, 4, 1, 99999, 2, 1])
+        with self.assertRaises(ValueError):
+            generate_trap_command(entry, version="99")
+
+    def test_from_fixture_notification(self):
+        entries, _, _ = extract_from_files(
+            paths=[FIXTURES / "EXAMPLE-DEVICE-MIB.txt"],
+            mib_dirs=[FIXTURES],
+        )
+        notifications = [e for e in entries if e.kind == "NOTIFICATION-TYPE"]
+        self.assertEqual(len(notifications), 1)
+        cmd = generate_trap_command(notifications[0])
+        self.assertEqual(cmd, "snmptrap -v 2c -c public localhost '' 1.3.6.1.4.1.99999.2.1")
 
 
 if __name__ == "__main__":

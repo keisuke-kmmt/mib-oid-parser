@@ -643,6 +643,53 @@ def print_csv(entries: List[OidEntry]) -> None:
         writer.writerow([e.name, e.kind, e.oid_str, e.module_name or "", e.source, e.description])
 
 
+def generate_trap_command(
+    entry: OidEntry,
+    host: str = "localhost",
+    community: str = "public",
+    version: str = "2c",
+) -> str:
+    """Return a snmptrap command string for the given NOTIFICATION-TYPE entry."""
+    if version == "1":
+        # For SNMPv1: snmptrap -v 1 -c <community> <host> <enterprise> "" 6 0 0
+        # Use the OID without the last component as the enterprise OID.
+        if len(entry.oid) > 1:
+            enterprise = ".".join(str(x) for x in entry.oid[:-1])
+            specific = str(entry.oid[-1])
+        else:
+            enterprise = entry.oid_str
+            specific = "0"
+        return (
+            f"snmptrap -v 1 -c {community} {host} "
+            f"{enterprise} \"\" 6 {specific} 0"
+        )
+    # SNMPv2c or SNMPv3
+    if version == "2c":
+        return f"snmptrap -v 2c -c {community} {host} '' {entry.oid_str}"
+    if version == "3":
+        return f"snmptrap -v 3 -u {community} -l noAuthNoPriv {host} '' {entry.oid_str}"
+    raise ValueError(f"Unsupported SNMP version: {version}")
+
+
+def print_trap_commands(
+    entries: List[OidEntry],
+    host: str = "localhost",
+    community: str = "public",
+    version: str = "2c",
+) -> None:
+    notifications = [e for e in entries if e.kind == "NOTIFICATION-TYPE"]
+    if not notifications:
+        print("No NOTIFICATION-TYPE entries found.", file=sys.stderr)
+        return
+    for entry in notifications:
+        cmd = generate_trap_command(entry, host=host, community=community, version=version)
+        print(f"# {entry.name}  OID: {entry.oid_str}")
+        if entry.description:
+            print(f"# {_single_line(entry.description)}")
+        print(cmd)
+        print()
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Extract and resolve OIDs from SNMP MIB files without external dependencies."
@@ -650,9 +697,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("files", nargs="+", help="Path(s) to entry MIB files")
     parser.add_argument(
         "--format",
-        choices=["table", "json", "csv"],
+        choices=["table", "json", "csv", "trap-commands"],
         default="table",
-        help="Output format (default: table)",
+        help="Output format (default: table). Use 'trap-commands' to generate snmptrap commands.",
+    )
+    parser.add_argument(
+        "--trap-host",
+        default="localhost",
+        help="Target host for generated snmptrap commands (default: localhost)",
+    )
+    parser.add_argument(
+        "--trap-community",
+        default="public",
+        help="Community string (or SNMPv3 username) for generated snmptrap commands (default: public)",
+    )
+    parser.add_argument(
+        "--trap-version",
+        choices=["1", "2c", "3"],
+        default="2c",
+        help="SNMP version for generated snmptrap commands (default: 2c)",
     )
     parser.add_argument(
         "--only-kind",
@@ -701,6 +764,13 @@ def main() -> int:
         print_json(entries)
     elif args.format == "csv":
         print_csv(entries)
+    elif args.format == "trap-commands":
+        print_trap_commands(
+            entries,
+            host=args.trap_host,
+            community=args.trap_community,
+            version=args.trap_version,
+        )
     else:
         print_table(entries)
 
